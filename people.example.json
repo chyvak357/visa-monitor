@@ -1,0 +1,20 @@
+[
+  {
+    "name": "Юзер 1",
+    "lastname": "IVANOV",
+    "firstname": "IVAN",
+    "email": "ivan@example.com",
+    "phone": "+995555123456",
+    "birthdate": "14.01.1990",
+    "purpose": "туризм"
+  },
+  {
+    "name": "Юзер 2",
+    "lastname": "IVANOVA",
+    "firstname": "MARIA",
+    "email": "maria@example.com",
+    "phone": "+995555654321",
+    "birthdate": "02.03.1992",
+    "purpose": "туризм"
+  }
+]

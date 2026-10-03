@@ -1,0 +1,5 @@
+node_modules/
+.browser-profile/
+.env
+data/
+people.json

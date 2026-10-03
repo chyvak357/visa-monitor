@@ -1,0 +1,19 @@
+{
+  "name": "visa-monitor",
+  "version": "1.0.0",
+  "description": "Монитор слотов на визу (Посольство Франции, Тбилиси) с алертами в Telegram",
+  "main": "monitor.js",
+  "scripts": {
+    "start": "node monitor.js",
+    "setup": "node setup.js",
+    "book": "node book.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "patchright": "^1.63.0"
+  },
+  "private": true
+}
