@@ -4,30 +4,55 @@
  * Что и почему так устроено — SITE.md.
  */
 
+const fs = require('fs');
+const { spawn } = require('child_process');
 const { chromium } = require('patchright');
 const { log, sleep } = require('./util');
-const { PATHS } = require('./config');
+const { PATHS, config } = require('./config');
 
 const API = 'https://api.consulat.gouv.fr/';
 const SERVICE_MATCH = /раткосрочные визы/i; // первая «K» на сайте латинская — ищем по середине слова
 const SERVICE_NAME_FR = 'Visa de court séjour (sans installation en France)'; // так услуга называется в API
 
 const SESSION_MAX_AGE_MS = 3 * 60_000; // сервер убивает сессию через 2–6 мин после создания
+const NESTED_SIZE = '1280,900'; // размер окна Xephyr и Chrome в нём
 const TURNSTILE_AUTO_MS = 60_000; // сколько ждём, что Turnstile пройдёт сам
 const TURNSTILE_HUMAN_MS = 10 * 60_000; // сколько ждём человека, если не прошёл
 
 class SessionExpired extends Error {}
 class RateLimited extends Error {}
 
+/**
+ * Поднимает Xephyr — вложенный X-сервер в отдельном окне. Chrome внутри него не может
+ * отобрать фокус у остального рабочего стола, а капчу по-прежнему можно пройти руками.
+ */
+async function nestedDisplay(display) {
+  const socket = `/tmp/.X11-unix/X${display.replace(/^:/, '')}`;
+  if (fs.existsSync(socket)) return; // уже запущен (например, остался с прошлого раза)
+  const x = spawn('Xephyr', [display, '-screen', NESTED_SIZE.replace(',', 'x'), '-resizeable', '-no-host-grab', '-title', 'visa-monitor'], {
+    stdio: 'ignore',
+  });
+  x.on('error', (e) => log('Xephyr не запустился:', e.message));
+  process.on('exit', () => x.kill());
+  for (let i = 0; i < 50 && !fs.existsSync(socket); i++) await sleep(100);
+  if (!fs.existsSync(socket)) throw new Error(`Xephyr не поднялся на ${display}`);
+}
+
 async function launch() {
   // Из-под Wayland Chrome поднимает Qt-шим на wayland и падает — на Linux принудительно X11.
   const linux = process.platform === 'linux';
+  const display = linux && config().nestedDisplay.replace(/^:?(?=.)/, ':'); // «99» и «:99» — одно и то же
+  if (display) await nestedDisplay(display);
   const ctx = await chromium.launchPersistentContext(PATHS.profile, {
     channel: 'chrome', // настоящий Google Chrome, не bundled Chromium — его Turnstile не пускает
     headless: false,
+    chromiumSandbox: true, // иначе Playwright добавляет --no-sandbox и Chrome показывает плашку-предупреждение
     viewport: null,
-    args: linux ? ['--ozone-platform=x11'] : [],
-    env: linux ? { ...process.env, XDG_SESSION_TYPE: 'x11', QT_QPA_PLATFORM: 'xcb' } : undefined,
+    // Во Xephyr нет оконного менеджера — размер и позицию окна задаём сами.
+    args: linux ? ['--ozone-platform=x11', ...(display ? [`--window-size=${NESTED_SIZE}`, '--window-position=0,0'] : [])] : [],
+    env: linux
+      ? { ...process.env, XDG_SESSION_TYPE: 'x11', QT_QPA_PLATFORM: 'xcb', ...(display && { DISPLAY: display }) }
+      : undefined,
   });
   const page = ctx.pages()[0] || (await ctx.newPage());
   return { ctx, page };
