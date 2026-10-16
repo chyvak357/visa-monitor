@@ -29,15 +29,15 @@ const arg = (name) => {
     process.exit(1);
   }
   const dryRun = !process.argv.includes('--real');
-  const { ctx, page } = await launch();
+  const browser = await launch();
   try {
-    const res = await book(page, config(), people[n - 1], date, time, { dryRun });
+    const res = await book(browser, config(), people[n - 1], date, time, { dryRun });
     log(res.dry ? 'пробный прогон: всё заполнено, «Подтвердить» не нажата — посмотрите на окно' : 'запись отправлена');
     await sleep(dryRun ? 60_000 : 10_000);
   } catch (e) {
     log('не вышло:', e.message);
     await sleep(30_000);
   } finally {
-    await ctx.close();
+    await browser.close();
   }
 })();

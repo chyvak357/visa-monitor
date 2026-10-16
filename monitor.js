@@ -94,21 +94,21 @@ async function main() {
     return `${status.fails ? '🟡' : '🟢'} <b>Мониторинг работает</b> с ${hhmm(status.startedAt)}\n${lines.join('\n')}`;
   };
 
-  const { ctx, page } = await launch();
+  const browser = await launch();
   let stopping = false;
-  ctx.on('close', () => {
+  browser.onClosed = () => {
     if (stopping) return;
     log('окно браузера закрыто — выхожу');
     process.exit(1);
-  });
+  };
   process.on('SIGINT', async () => {
     log('остановка');
     stopping = true;
-    await ctx.close().catch(() => {});
+    await browser.close();
     process.exit(0);
   });
 
-  const callHuman = (text) => bot.screenToOwner(page, text);
+  const callHuman = (text) => bot.screenToOwner(browser.page, text);
   let sess = null;
 
   // ─── Запись по кнопкам из Telegram ────────────────────────────────────────
@@ -148,12 +148,13 @@ async function main() {
     enqueue({ type: 'book', chatId: String(q.message.chat.id), date, time: unpackTime(hm), persons, all: who === 'all' });
   });
 
-  bot.callback('fill', async (q, [idx]) => {
+  bot.callback('fill', async (q, [idx, date, hm]) => {
     const person = loadPeople()[Number(idx)];
     if (!person) return bot.answer(q.id, 'Не нашёл человека в people.json');
     await bot.answer(q.id, 'Принято');
     await bot.edit(q.message.chat.id, q.message.message_id, `⏳ Дозаполняю форму за ${esc(person.name)}…`);
-    enqueue({ type: 'fill', chatId: String(q.message.chat.id), persons: [person] });
+    const slot = date && hm ? { date, time: unpackTime(hm) } : null;
+    enqueue({ type: 'fill', chatId: String(q.message.chat.id), persons: [person], slot });
   });
 
   // Код из письма: ждём следующее сообщение из того чата, откуда пришла запись.
@@ -181,10 +182,12 @@ async function main() {
   async function runJob(job) {
     cfg = config();
     const notify = async (text) => {
-      const png = await page.screenshot().catch(() => null);
+      const png = await browser.page.screenshot().catch(() => null);
       for (const id of new Set([job.chatId, bot.ownerId])) await bot.sendPhoto(id, png, text);
     };
     const opts = { dryRun: cfg.bookingDryRun, onStuck: callHuman, askCode: askCode(job.chatId) };
+    // Окно уже стоит на календаре, где нашлись слоты, — первого человека записываем прямо в нём.
+    let calendar = sess;
 
     // «Всех по порядку»: выбранный слот и следующие за ним из последней проверки.
     const chosen = `${job.date} ${job.time}`;
@@ -199,16 +202,18 @@ async function main() {
         continue;
       }
       try {
-        let slot = 'слот, выбранный в окне';
+        let slot = job.slot ? `${fmtDay(job.slot.date)} ${job.slot.time}` : 'слот, выбранный в окне';
         let res;
-        if (job.type === 'fill') res = await fillAndConfirm(page, person, opts);
+        if (job.type === 'fill') res = await fillAndConfirm(browser, cfg, person, job.slot, opts);
         else {
           for (;;) {
             const key = queue.shift();
             if (!key) throw new SlotGone('свободных слотов не осталось');
             const [date, time] = key.split(' ');
+            const sess = calendar;
+            calendar = null; // дальше окно уйдёт с календаря
             try {
-              res = await book(page, cfg, person, date, time, opts);
+              res = await book(browser, cfg, person, date, time, { ...opts, sess });
               slot = `${fmtDay(date)} ${time}`;
               break;
             } catch (e) {
@@ -233,7 +238,8 @@ async function main() {
 
   /** Держим окно на календаре; если человек сам выбрал время — предлагаем дозаполнить форму. */
   async function holdWindow() {
-    sess = await openSession(page, cfg, callHuman).catch((e) => log('не удалось открыть календарь для брони:', e.message));
+    sess = await openSession(browser, cfg, callHuman).catch((e) => log('не удалось открыть календарь для брони:', e.message));
+    const page = browser.page;
     await page.bringToFront().catch(() => {});
     status.holdUntil = Date.now() + cfg.holdMin * 60_000;
     log(`держу окно ${cfg.holdMin} мин`);
@@ -250,7 +256,7 @@ async function main() {
       const [date, slots] = Object.entries(body.value?.slots || {})[0] || [];
       if (body.key !== 'slotsStep' || !slots?.length) return;
       bot.toOwner(`🖱 В окне выбран слот <b>${fmtDay(date)} ${slots[0].time}</b>. За кого заполнить форму?`, {
-        buttons: [people.map((p, i) => [p.name, `fill:${i}`])],
+        buttons: [people.map((p, i) => [p.name, `fill:${i}:${date}:${packTime(slots[0].time)}`])],
       });
     };
     page.on('request', onRequest);
@@ -259,7 +265,8 @@ async function main() {
     } finally {
       page.off('request', onRequest);
       status.holdUntil = 0;
-      sess = null;
+      // Пришла запись — она продолжит в этом же календаре; иначе для опроса нужна новая сессия.
+      if (!jobs.length) sess = null;
     }
   }
 
@@ -285,16 +292,16 @@ async function main() {
 
     try {
       cfg = config();
-      if (!sessionFresh(sess)) sess = await openSession(page, cfg, callHuman);
+      if (!sessionFresh(sess)) sess = await openSession(browser, cfg, callHuman);
 
       let result;
       try {
-        result = await scan(page, sess, cfg);
+        result = await scan(browser.page, sess, cfg);
       } catch (e) {
         if (!(e instanceof SessionExpired)) throw e;
         log('сессия умерла раньше срока — пересоздаю');
-        sess = await openSession(page, cfg, callHuman);
-        result = await scan(page, sess, cfg);
+        sess = await openSession(browser, cfg, callHuman);
+        result = await scan(browser.page, sess, cfg);
       }
       const { found, from, to } = result;
 
@@ -334,7 +341,7 @@ async function main() {
   }
 
   stopping = true;
-  await ctx.close();
+  await browser.close();
 }
 
 main().catch((e) => {

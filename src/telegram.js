@@ -11,6 +11,8 @@ const { log, sleep, esc } = require('./util');
 const { PATHS, readJson, writeJson } = require('./config');
 
 const TG_LIMIT = 3800; // потолок Telegram — 4096, держим запас
+const TG_TIMEOUT_SEC = 30; // на запрос сверх long-poll таймаута getUpdates
+const TG_ATTEMPTS = 3;
 
 const HELP = '/status — что сейчас с мониторингом\n/stop — отписаться от алертов';
 
@@ -69,24 +71,30 @@ class Bot {
   // ─── Низкий уровень ───────────────────────────────────────────────────────
 
   async api(method, params = {}, form = null) {
+    // Без таймаута запрос после смены сети может навсегда повиснуть на мёртвом соединении.
+    const signal = AbortSignal.timeout(((params?.timeout || 0) + TG_TIMEOUT_SEC) * 1000);
     const r = await fetch(
       `https://api.telegram.org/bot${this.token}/${method}`,
       form
-        ? { method: 'POST', body: form }
-        : { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(params) }
+        ? { method: 'POST', body: form, signal }
+        : { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(params), signal }
     );
     const j = await r.json().catch(() => ({ ok: false, description: `HTTP ${r.status}` }));
     if (!j.ok) throw new TgError(j.description, j.error_code);
     return j.result;
   }
 
-  /** Для уведомлений: ошибка Telegram не должна ронять мониторинг. */
+  /** Для уведомлений: ошибка Telegram не должна ронять мониторинг. Сетевые сбои, 429 и 5xx повторяем. */
   async safe(method, params, form) {
-    try {
-      return await this.api(method, params, form);
-    } catch (e) {
-      log(`Telegram ${method}:`, e.message);
-      return null;
+    for (let attempt = 1; ; attempt++) {
+      try {
+        return await this.api(method, params, form);
+      } catch (e) {
+        const retryable = !e.code || e.code === 429 || e.code >= 500;
+        log(`Telegram ${method} (попытка ${attempt}):`, e.message);
+        if (!retryable || attempt >= TG_ATTEMPTS) return null;
+        await sleep(3000 * attempt);
+      }
     }
   }
 
@@ -113,7 +121,8 @@ class Bot {
     form.append('caption', caption.slice(0, 1000));
     form.append('photo', new Blob([png], { type: 'image/png' }), 'screen.png');
     if (buttons) form.append('reply_markup', JSON.stringify(keyboard(buttons)));
-    return this.safe('sendPhoto', null, form);
+    // Не ушла картинка — пусть дойдёт хотя бы текст.
+    return (await this.safe('sendPhoto', null, form)) ?? this.send(chatId, esc(caption), { buttons });
   }
 
   edit(chatId, messageId, html, { buttons } = {}) {

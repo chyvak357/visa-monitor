@@ -60,6 +60,8 @@ function config() {
     requestDelayMs: Number(get('REQUEST_DELAY_MS', 300)),
     bookingDryRun: get('BOOKING_DRY_RUN', '0') === '1',
     nestedDisplay: get('NESTED_DISPLAY', ''),
+    freshBrowser: get('FRESH_BROWSER', '1') === '1',
+    captchaAutoclick: process.argv.includes('--autoclick') || get('CAPTCHA_AUTOCLICK', '0') === '1',
     bookingUrl: get(
       'BOOKING_URL',
       'https://consulat.gouv.fr/ru/ambassade-de-france-a-tbilissi/appointment?name=Service%20des%20Visas'

@@ -6,13 +6,15 @@
  * Данные людей — people.json (см. people.example.json). Один человек = один слот.
  */
 
-const { log, sleep } = require('./util');
+const { log, sleep, fmtDay } = require('./util');
 const { PATHS, readJson } = require('./config');
-const { openSession, waitTurnstile } = require('./site');
+const { openSession, retryCaptcha, waitTurnstile, sessionFresh, dayTimes, CaptchaStuck } = require('./site');
 
 const API = 'https://api.consulat.gouv.fr/';
 const PERSON_FIELDS = ['name', 'lastname', 'firstname', 'email', 'phone', 'birthdate', 'purpose'];
 const DEFAULT_DIAL = '+995'; // код страны, выбранный в форме по умолчанию
+const SLOT_RELEASE_MS = 7 * 60_000; // брошенная сессия живёт до 6 мин — дольше её слот держаться не должен
+const RELEASE_POLL_MS = 15_000; // как часто проверять, не отпустили ли слот
 
 class BookingError extends Error {}
 class SlotGone extends BookingError {}
@@ -163,18 +165,91 @@ async function confirm(page, { dryRun, onStuck, askCode }) {
   }
 }
 
-/** Полная запись с нуля: свежая сессия → слот → форма → подтверждение. */
-async function book(page, cfg, person, date, time, opts = {}) {
-  log(`запись: ${person.name} → ${date} ${time}${opts.dryRun ? ' (пробный прогон)' : ''}`);
-  await openSession(page, cfg, opts.onStuck);
-  await pickSlot(page, date, time);
-  await fillContacts(page, person);
-  return confirm(page, opts);
+/**
+ * Выбирает слот прямо в календаре, на котором уже стоит окно (sess — его сессия), без перезагрузки.
+ * Не вышло (сессия умерла, календарь устарел, человек ушёл со страницы) — открывает календарь заново.
+ */
+async function toSlot(browser, cfg, date, time, sess, onStuck) {
+  const onCalendar = sessionFresh(sess) && (await browser.page.locator('.vc-day').first().isVisible().catch(() => false));
+  if (onCalendar) {
+    try {
+      return await pickSlot(browser.page, date, time);
+    } catch (e) {
+      log(`в открытом календаре не вышло (${e.message}) — открываю заново`);
+    }
+  }
+  await openSession(browser, cfg, onStuck);
+  await pickSlot(browser.page, date, time);
 }
 
-/** Слот уже выбран руками в окне робота — дозаполняем форму. */
-async function fillAndConfirm(page, person, opts = {}) {
+/**
+ * Слот выбран в сессии, которую бросили из-за капчи: пока она жива, другим (и нам) он не виден.
+ * Держим новую сессию, опрашиваем этот день и забираем время, как только сайт его отпустит.
+ */
+async function toReleasedSlot(browser, cfg, date, time, heldSince, onStuck) {
+  const deadline = heldSince + SLOT_RELEASE_MS;
+  Promise.resolve(
+    onStuck?.(
+      `⏳ Браузер перезапущен, слот ${fmtDay(date)} ${time} пока держит брошенная сессия. ` +
+        `Жду, пока сайт его отпустит (до ${SLOT_RELEASE_MS / 60_000} мин), и сразу забираю.`
+    )
+  ).catch(() => {});
+  let sess = null;
+  for (;;) {
+    const reopened = !sessionFresh(sess);
+    if (reopened) sess = await openSession(browser, cfg, onStuck);
+    try {
+      return await pickSlot(browser.page, date, time);
+    } catch (e) {
+      if (!(e instanceof SlotGone) || Date.now() > deadline) throw e;
+      if (!reopened) {
+        sess = null; // время отпустили, но календарь на странице устарел — открываем заново
+        continue;
+      }
+    }
+    log(`слот ${date} ${time} ещё держит брошенная сессия — жду`);
+    let freed = false;
+    while (!freed && sessionFresh(sess) && Date.now() < deadline) {
+      await sleep(RELEASE_POLL_MS);
+      const times = await dayTimes(browser.page, sess, date).catch((e) => log('не смог проверить день:', e.message));
+      if (times) freed = times.includes(time);
+      else sess = null;
+    }
+    if (!freed) sess = null; // сессия кончилась или вышел срок — последняя попытка с новой
+  }
+}
+
+/**
+ * Запись: слот → форма → подтверждение. opts.sess — сессия календаря, открытого в окне сейчас:
+ * с ней продолжаем в том же окне, без неё начинаем с новой сессии.
+ * Застряла финальная капча — перезапускаем браузер и проходим всё заново, дождавшись, пока
+ * сайт отпустит слот, взятый брошенной сессией. opts.slotHeld — слот уже взят такой сессией.
+ */
+async function book(browser, cfg, person, date, time, opts = {}) {
+  log(`запись: ${person.name} → ${date} ${time}${opts.dryRun ? ' (пробный прогон)' : ''}`);
+  let sess = opts.sess;
+  let heldSince = opts.slotHeld ? Date.now() : 0;
+  return retryCaptcha(
+    browser,
+    async () => {
+      if (heldSince) await toReleasedSlot(browser, cfg, date, time, heldSince, opts.onStuck);
+      else await toSlot(browser, cfg, date, time, sess, opts.onStuck);
+      sess = null; // после перезапуска браузера — только новая сессия
+      await fillContacts(browser.page, person);
+      return confirm(browser.page, opts);
+    },
+    // Капчу входа openSession перезапускает сам, сюда доходит только капча подтверждения — слот уже взят.
+    () => (heldSince = Date.now())
+  );
+}
+
+/**
+ * Слот уже выбран руками в окне робота — дозаполняем форму.
+ * slot {date, time} — какой именно: если застрянет финальная капча, запишем на него с нуля.
+ */
+async function fillAndConfirm(browser, cfg, person, slot, opts = {}) {
   log(`дозаполняю форму за ${person.name}${opts.dryRun ? ' (пробный прогон)' : ''}`);
+  const page = browser.page;
   // Человек мог выбрать время, но не нажать «Проверить календарь».
   const accept = page.getByRole('button', { name: /Проверить календарь|Valider/i });
   if (await accept.isVisible().catch(() => false)) {
@@ -183,7 +258,14 @@ async function fillAndConfirm(page, person, opts = {}) {
     await saved;
   }
   await fillContacts(page, person);
-  return confirm(page, opts);
+  try {
+    return await confirm(page, opts);
+  } catch (e) {
+    if (!(e instanceof CaptchaStuck) || !slot) throw e;
+    log('капча не пройдена — перезапускаю браузер и записываю заново');
+    await browser.restart();
+    return book(browser, cfg, person, slot.date, slot.time, { ...opts, sess: null, slotHeld: true });
+  }
 }
 
 module.exports = { loadPeople, book, fillAndConfirm, BookingError, SlotGone };
