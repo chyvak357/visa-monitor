@@ -56,6 +56,7 @@ function config() {
     dateFrom: get('DATE_FROM', today()),
     dateTo: get('DATE_TO', addDays(today(), 60)),
     pollSec: Number(get('POLL_SECONDS', 120)),
+    pollMinSec: Number(get('POLL_MIN_SECONDS', '')) || Number(get('POLL_SECONDS', 120)), // пусто — без ускорения
     holdMin: Number(get('HOLD_AFTER_ALERT_MIN', 10)),
     requestDelayMs: Number(get('REQUEST_DELAY_MS', 300)),
     bookingDryRun: get('BOOKING_DRY_RUN', '0') === '1',

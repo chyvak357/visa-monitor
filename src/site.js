@@ -17,6 +17,7 @@ const SERVICE_NAME_FR = 'Visa de court séjour (sans installation en France)'; /
 
 const SESSION_MAX_AGE_MS = 3 * 60_000; // сервер убивает сессию через 2–6 мин после создания
 const STATS_EXTRA_DAYS = 5; // дней с местами вне диапазона, по которым за круг смотрим время (для статистики)
+const STATS_EXTRA_EVERY_MS = 60_000; // день вне диапазона: время — сразу как открылся, дальше не чаще этого
 const NESTED_SIZE = '1280,900'; // размер окна Xephyr и Chrome в нём
 const TURNSTILE_AUTO_MS = 60_000; // сколько ждём, что Turnstile пройдёт сам
 const TURNSTILE_RESET_MS = 20_000; // пока ждём сами — так часто перезапускаем зависший виджет
@@ -371,13 +372,15 @@ async function dayTimes(page, sess, date) {
  * (им сайт красит календарь), availability дёргаем только по остальным дням диапазона.
  * Плюс для статистики — по нескольким дням с местами вне диапазона; в алерты они не попадают.
  */
+const extraTimedAt = new Map(); // день вне диапазона → когда последний раз смотрели его время
+
 async function scan(page, sess, cfg) {
   const from = cfg.dateFrom > sess.interval.start ? cfg.dateFrom : sess.interval.start;
   const to = cfg.dateTo < sess.interval.end ? cfg.dateTo : sess.interval.end;
 
   const t0 = Date.now();
   const res = await page.evaluate(
-    async ({ availabilityUrl, excludeReq, headers, from, to, start, end, maxExtra, delay }) => {
+    async ({ availabilityUrl, excludeReq, headers, from, to, start, end, maxExtra, skip, delay }) => {
       const wait = (ms) => new Promise((r) => setTimeout(r, ms));
       const fail = (status, body) => ({ error: { status, body: body.slice(0, 200) } });
 
@@ -398,7 +401,7 @@ async function scan(page, sess, cfg) {
         const iso = d.toISOString().slice(0, 10);
         if (excluded.has(iso)) continue;
         if (iso >= from && iso <= to) dates.push(iso);
-        else extra.push(iso);
+        else if (!skip.includes(iso)) extra.push(iso);
       }
       const inRange = dates.length;
       dates.push(...extra.slice(0, maxExtra));
@@ -408,6 +411,7 @@ async function scan(page, sess, cfg) {
       let retries = 0;
       let i = 0;
       while (i < dates.length) {
+        if (i === inRange && out.length) break; // в диапазоне есть место — сразу к алерту, статистика подождёт
         const date = dates[i];
         const u = new URL(availabilityUrl);
         u.searchParams.set('date', date);
@@ -442,6 +446,7 @@ async function scan(page, sess, cfg) {
       start: sess.interval.start.slice(0, 10),
       end: sess.interval.end.slice(0, 10),
       maxExtra: STATS_EXTRA_DAYS,
+      skip: [...extraTimedAt].filter(([, at]) => Date.now() - at < STATS_EXTRA_EVERY_MS).map(([d]) => d),
       delay: cfg.requestDelayMs,
     }
   );
@@ -453,6 +458,10 @@ async function scan(page, sess, cfg) {
     throw new Error(`API ответил ${status}: ${body}`);
   }
   log(`проверено дней с местами: ${res.checked} за ${((Date.now() - t0) / 1000).toFixed(1)} с`);
+  for (const d of res.timed.slice(res.checked)) extraTimedAt.set(d, Date.now());
+  // Закрылся — забываем: если снова откроется, время посмотрим сразу.
+  const closed = new Set(res.excluded);
+  for (const d of extraTimedAt.keys()) if (closed.has(d) || d < sess.interval.start.slice(0, 10) || d > sess.interval.end.slice(0, 10)) extraTimedAt.delete(d);
   // Сырые наблюдения для статистики: exclude-days покрывает всё окно, время — по дням из timed.
   const obs = {
     interval: sess.interval,

@@ -25,6 +25,8 @@ const { record } = require('./src/stats');
 const FAILS_BEFORE_ALERT = 3; // ошибок подряд до уведомления владельцу
 const REALERT_MS = 30 * 60_000; // не напоминать про тот же слот чаще
 const MAX_SLOT_BUTTONS = 24; // кнопок «записать» в одном алерте
+const POLL_SPEEDUP = 0.85; // после удачного круга интервал опроса × столько, пока не дойдёт до POLL_MIN_SECONDS
+const POLL_FLOOR_AFTER_429 = 1.5; // упёрлись в 429 — ниже «интервал × столько» до перезапуска не опускаемся
 const CODE_WAIT_MS = 10 * 60_000; // сколько ждать код из письма
 
 const ONCE = process.argv.includes('--once');
@@ -76,8 +78,13 @@ async function main() {
   // Что показывать по /status.
   const status = { startedAt: Date.now(), lastCheck: 0, found: [], fails: 0, lastError: '', holdUntil: 0 };
   const booked = new Map(); // имя → слот, записанный в этом запуске (защита от двойной записи)
+
+  // Адаптивный интервал опроса: от POLL_SECONDS спускается к POLL_MIN_SECONDS, на 429 откатывается назад.
+  const pace = { sec: cfg.pollSec, floor: 0 };
+  const clampPace = (sec) => Math.min(cfg.pollSec, Math.max(cfg.pollMinSec, pace.floor, sec));
+
   bot.statusText = () => {
-    const lines = [`Диапазон: ${fmtDay(cfg.dateFrom)} – ${fmtDay(cfg.dateTo)}, опрос ~${Math.round(cfg.pollSec / 60) || 1} мин`];
+    const lines = [`Диапазон: ${fmtDay(cfg.dateFrom)} – ${fmtDay(cfg.dateTo)}, опрос ~${Math.round(pace.sec)} с`];
     if (status.holdUntil > Date.now()) lines.push(`🪟 Окно держится для брони до ${hhmm(status.holdUntil)}`);
     if (!status.lastCheck) lines.push('Ещё ни одной проверки');
     else {
@@ -281,8 +288,8 @@ async function main() {
   // ─── Главный цикл ─────────────────────────────────────────────────────────
 
   bot.start();
-  log(`старт: ${cfg.dateFrom} … ${cfg.dateTo}, опрос ~${cfg.pollSec} с`);
-  record('start', { range: [cfg.dateFrom, cfg.dateTo], pollSec: cfg.pollSec });
+  log(`старт: ${cfg.dateFrom} … ${cfg.dateTo}, опрос ${cfg.pollMinSec < cfg.pollSec ? `${cfg.pollSec} → ${cfg.pollMinSec}` : `~${cfg.pollSec}`} с`);
+  record('start', { range: [cfg.dateFrom, cfg.dateTo], pollSec: cfg.pollSec, pollMinSec: cfg.pollMinSec });
   if (!ONCE) {
     const people = loadPeople();
     await bot.toOwner(
@@ -308,12 +315,16 @@ async function main() {
         result = await scan(browser.page, sess, cfg);
       } catch (e) {
         if (!(e instanceof SessionExpired)) throw e;
-        log('сессия умерла раньше срока — пересоздаю');
+        const age = Math.round((Date.now() - sess.createdAt) / 1000);
+        log(`сессия умерла раньше срока (${age} с) — пересоздаю`);
+        record('expired', { age });
         sess = await openSession(browser, cfg, callHuman);
         result = await scan(browser.page, sess, cfg);
       }
       const { found, from, to } = result;
-      record('scan', result.obs);
+      const sessAge = Math.round((Date.now() - sess.createdAt) / 1000);
+      record('scan', { ...result.obs, sessAge, pollSec: Math.round(pace.sec) });
+      pace.sec = clampPace(pace.sec * POLL_SPEEDUP);
 
       if (failAlerted) await bot.toOwner('✅ Мониторинг снова работает');
       Object.assign(status, { lastCheck: Date.now(), found, fails: 0, lastError: '' });
@@ -336,11 +347,17 @@ async function main() {
       }
     } catch (e) {
       if (stopping) break;
-      if (!(e instanceof RateLimited)) sess = null; // при 429 новая сессия — только лишние запросы
+      const rateLimited = e instanceof RateLimited;
+      if (!rateLimited) sess = null; // при 429 новая сессия — только лишние запросы
       const msg = e.message.split('\n')[0];
       Object.assign(status, { fails: status.fails + 1, lastError: msg });
       log(`ошибка (${status.fails} подряд): ${msg}`);
-      record('fail', { error: msg });
+      record('fail', { error: msg, ...(rateLimited && { rateLimited, pollSec: Math.round(pace.sec) }) });
+      if (rateLimited) {
+        log(`429 на интервале ~${Math.round(pace.sec)} с — откат к ${cfg.pollSec} с`);
+        pace.floor = Math.min(cfg.pollSec, pace.sec * POLL_FLOOR_AFTER_429);
+        pace.sec = cfg.pollSec;
+      }
       if (status.fails >= FAILS_BEFORE_ALERT && !failAlerted && !ONCE) {
         failAlerted = true;
         await callHuman(`⚠️ ${status.fails} раз подряд не получается проверить слоты:\n${msg}`);
@@ -348,7 +365,8 @@ async function main() {
     }
 
     if (ONCE) break;
-    if (!jobs.length) await nap(cfg.pollSec * 1000 * (0.8 + Math.random() * 0.4));
+    pace.sec = clampPace(pace.sec); // .env могли поменять на ходу
+    if (!jobs.length) await nap(pace.sec * 1000 * (0.8 + Math.random() * 0.4));
   }
 
   stopping = true;
