@@ -16,6 +16,7 @@ const SERVICE_MATCH = /раткосрочные визы/i; // первая «K�
 const SERVICE_NAME_FR = 'Visa de court séjour (sans installation en France)'; // так услуга называется в API
 
 const SESSION_MAX_AGE_MS = 3 * 60_000; // сервер убивает сессию через 2–6 мин после создания
+const STATS_EXTRA_DAYS = 5; // дней с местами вне диапазона, по которым за круг смотрим время (для статистики)
 const NESTED_SIZE = '1280,900'; // размер окна Xephyr и Chrome в нём
 const TURNSTILE_AUTO_MS = 60_000; // сколько ждём, что Turnstile пройдёт сам
 const TURNSTILE_RESET_MS = 20_000; // пока ждём сами — так часто перезапускаем зависший виджет
@@ -368,6 +369,7 @@ async function dayTimes(page, sess, date) {
 /**
  * Один круг опроса из контекста страницы. exclude-days одним запросом отдаёт все дни окна без мест
  * (им сайт красит календарь), availability дёргаем только по остальным дням диапазона.
+ * Плюс для статистики — по нескольким дням с местами вне диапазона; в алерты они не попадают.
  */
 async function scan(page, sess, cfg) {
   const from = cfg.dateFrom > sess.interval.start ? cfg.dateFrom : sess.interval.start;
@@ -375,7 +377,7 @@ async function scan(page, sess, cfg) {
 
   const t0 = Date.now();
   const res = await page.evaluate(
-    async ({ availabilityUrl, excludeReq, headers, from, to, delay }) => {
+    async ({ availabilityUrl, excludeReq, headers, from, to, start, end, maxExtra, delay }) => {
       const wait = (ms) => new Promise((r) => setTimeout(r, ms));
       const fail = (status, body) => ({ error: { status, body: body.slice(0, 200) } });
 
@@ -386,17 +388,26 @@ async function scan(page, sess, cfg) {
       });
       const exBody = await ex.text();
       if (ex.status !== 200) return fail(ex.status, exBody);
-      const excluded = new Set(JSON.parse(exBody));
+      const excludedList = JSON.parse(exBody);
+      const excluded = new Set(excludedList);
 
+      // Сначала дни своего диапазона, за ними — дни вне его, только для статистики.
       const dates = [];
-      for (let d = new Date(from + 'T00:00:00Z'); d.toISOString().slice(0, 10) <= to; d.setUTCDate(d.getUTCDate() + 1)) {
+      const extra = [];
+      for (let d = new Date(start + 'T00:00:00Z'); d.toISOString().slice(0, 10) <= end; d.setUTCDate(d.getUTCDate() + 1)) {
         const iso = d.toISOString().slice(0, 10);
-        if (!excluded.has(iso)) dates.push(iso);
+        if (excluded.has(iso)) continue;
+        if (iso >= from && iso <= to) dates.push(iso);
+        else extra.push(iso);
       }
+      const inRange = dates.length;
+      dates.push(...extra.slice(0, maxExtra));
 
       const out = [];
+      const raw = {}; // дата → [[время, capacity]] — для статистики
       let retries = 0;
-      for (let i = 0; i < dates.length; ) {
+      let i = 0;
+      while (i < dates.length) {
         const date = dates[i];
         const u = new URL(availabilityUrl);
         u.searchParams.set('date', date);
@@ -404,18 +415,23 @@ async function scan(page, sess, cfg) {
         const body = await r.text();
         // Пропущенный из-за лимита день нельзя считать «мест нет» — повторяем его же, потом сдаёмся.
         if (r.status === 429) {
+          if (i >= inRange) break; // статистика не стоит лимита
           if (++retries > 3) return fail(429, body);
           await wait(5000 * 2 ** (retries - 1));
           continue;
         }
         if (r.status !== 200) return fail(r.status, body);
         const slots = JSON.parse(body);
-        if (slots.length) out.push({ date, times: slots.map((s) => s.time) });
+        if (slots.length) {
+          if (i < inRange) out.push({ date, times: slots.map((s) => s.time) });
+          raw[date] = slots.map((s) => [s.time, s.capacity]);
+        }
         retries = 0;
         i++;
         await wait(delay);
       }
-      return { out, checked: dates.length };
+      const inWindow = excludedList.filter((d) => d >= start && d <= end); // остальное — история с 2022 года
+      return { out, checked: inRange, timed: dates.slice(0, i), excluded: inWindow, raw };
     },
     {
       availabilityUrl: sess.availabilityUrl,
@@ -423,6 +439,9 @@ async function scan(page, sess, cfg) {
       headers: sess.headers,
       from,
       to,
+      start: sess.interval.start.slice(0, 10),
+      end: sess.interval.end.slice(0, 10),
+      maxExtra: STATS_EXTRA_DAYS,
       delay: cfg.requestDelayMs,
     }
   );
@@ -434,7 +453,16 @@ async function scan(page, sess, cfg) {
     throw new Error(`API ответил ${status}: ${body}`);
   }
   log(`проверено дней с местами: ${res.checked} за ${((Date.now() - t0) / 1000).toFixed(1)} с`);
-  return { found: res.out, from, to };
+  // Сырые наблюдения для статистики: exclude-days покрывает всё окно, время — по дням из timed.
+  const obs = {
+    interval: sess.interval,
+    excludeReq: sess.excludeReq.body,
+    excluded: res.excluded,
+    range: [from, to],
+    timed: res.timed,
+    slots: res.raw,
+  };
+  return { found: res.out, from, to, obs };
 }
 
 module.exports = {

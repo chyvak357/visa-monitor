@@ -20,6 +20,7 @@ const { config } = require('./src/config');
 const { Bot } = require('./src/telegram');
 const { launch, openSession, sessionFresh, scan, SessionExpired, RateLimited } = require('./src/site');
 const { loadPeople, book, fillAndConfirm, SlotGone } = require('./src/booking');
+const { record } = require('./src/stats');
 
 const FAILS_BEFORE_ALERT = 3; // ошибок подряд до уведомления владельцу
 const REALERT_MS = 30 * 60_000; // не напоминать про тот же слот чаще
@@ -99,10 +100,12 @@ async function main() {
   browser.onClosed = () => {
     if (stopping) return;
     log('окно браузера закрыто — выхожу');
+    record('stop', { reason: 'browser closed' });
     process.exit(1);
   };
   process.on('SIGINT', async () => {
     log('остановка');
+    record('stop', { reason: 'SIGINT' });
     stopping = true;
     await browser.close();
     process.exit(0);
@@ -204,7 +207,10 @@ async function main() {
       try {
         let slot = job.slot ? `${fmtDay(job.slot.date)} ${job.slot.time}` : 'слот, выбранный в окне';
         let res;
-        if (job.type === 'fill') res = await fillAndConfirm(browser, cfg, person, job.slot, opts);
+        if (job.type === 'fill') {
+          record('book', { ...job.slot, dry: cfg.bookingDryRun });
+          res = await fillAndConfirm(browser, cfg, person, job.slot, opts);
+        }
         else {
           for (;;) {
             const key = queue.shift();
@@ -213,6 +219,7 @@ async function main() {
             const sess = calendar;
             calendar = null; // дальше окно уйдёт с календаря
             try {
+              record('book', { date, time, dry: cfg.bookingDryRun });
               res = await book(browser, cfg, person, date, time, { ...opts, sess });
               slot = `${fmtDay(date)} ${time}`;
               break;
@@ -243,6 +250,7 @@ async function main() {
     await page.bringToFront().catch(() => {});
     status.holdUntil = Date.now() + cfg.holdMin * 60_000;
     log(`держу окно ${cfg.holdMin} мин`);
+    record('hold', { min: cfg.holdMin });
 
     const people = loadPeople();
     const onRequest = (r) => {
@@ -274,6 +282,7 @@ async function main() {
 
   bot.start();
   log(`старт: ${cfg.dateFrom} … ${cfg.dateTo}, опрос ~${cfg.pollSec} с`);
+  record('start', { range: [cfg.dateFrom, cfg.dateTo], pollSec: cfg.pollSec });
   if (!ONCE) {
     const people = loadPeople();
     await bot.toOwner(
@@ -304,6 +313,7 @@ async function main() {
         result = await scan(browser.page, sess, cfg);
       }
       const { found, from, to } = result;
+      record('scan', result.obs);
 
       if (failAlerted) await bot.toOwner('✅ Мониторинг снова работает');
       Object.assign(status, { lastCheck: Date.now(), found, fails: 0, lastError: '' });
@@ -330,6 +340,7 @@ async function main() {
       const msg = e.message.split('\n')[0];
       Object.assign(status, { fails: status.fails + 1, lastError: msg });
       log(`ошибка (${status.fails} подряд): ${msg}`);
+      record('fail', { error: msg });
       if (status.fails >= FAILS_BEFORE_ALERT && !failAlerted && !ONCE) {
         failAlerted = true;
         await callHuman(`⚠️ ${status.fails} раз подряд не получается проверить слоты:\n${msg}`);
