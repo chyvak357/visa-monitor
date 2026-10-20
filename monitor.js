@@ -16,7 +16,7 @@
 'use strict';
 
 const { log, esc, fmtDay } = require('./src/util');
-const { config } = require('./src/config');
+const { PATHS, config, readJson, writeJson } = require('./src/config');
 const { Bot } = require('./src/telegram');
 const { launch, openSession, sessionFresh, scan, SessionExpired, RateLimited } = require('./src/site');
 const { loadPeople, book, fillAndConfirm, SlotGone } = require('./src/booking');
@@ -77,7 +77,17 @@ async function main() {
 
   // Что показывать по /status.
   const status = { startedAt: Date.now(), lastCheck: 0, found: [], fails: 0, lastError: '', holdUntil: 0 };
-  const booked = new Map(); // имя → слот, записанный в этом запуске (защита от двойной записи)
+  // Имя → слот: кто уже записан (защита от двойной записи). Хранится на диске — переживает перезапуск.
+  const booked = new Map(Object.entries(readJson(PATHS.booked, {})));
+  const markBooked = (name, slot) => {
+    booked.set(name, slot);
+    writeJson(PATHS.booked, Object.fromEntries(booked));
+  };
+  const bookingLine = (people) =>
+    people.length
+      ? `${cfg.bookingMode === 'auto' ? '🤖 Автозапись' : 'Запись по кнопке'}: ${people.map((p) => esc(p.name)).join(', ')}` +
+        (cfg.bookingDryRun ? ' (пробный режим)' : '')
+      : 'Запись выключена — нет people.json';
 
   // Адаптивный интервал опроса: от POLL_SECONDS спускается к POLL_MIN_SECONDS, на 429 откатывается назад.
   const pace = { sec: cfg.pollSec, floor: 0 };
@@ -92,13 +102,8 @@ async function main() {
       lines.push(status.found.length ? `Открыто:\n${daysLines(status.found).join('\n')}` : 'Слотов в диапазоне нет');
     }
     if (status.fails) lines.push(`⚠️ Ошибок подряд: ${status.fails} — ${esc(status.lastError)}`);
-    const people = loadPeople();
-    lines.push(
-      people.length
-        ? `Автозапись: ${people.map((p) => esc(p.name)).join(', ')}${cfg.bookingDryRun ? ' (пробный режим)' : ''}`
-        : 'Автозапись выключена — нет people.json'
-    );
-    for (const [name, slot] of booked) lines.push(`✅ ${esc(name)} записан: ${slot}`);
+    lines.push(bookingLine(loadPeople()));
+    for (const [name, slot] of booked) lines.push(`✅ ${esc(name)} записан: ${esc(slot)}`);
     return `${status.fails ? '🟡' : '🟢'} <b>Мониторинг работает</b> с ${hhmm(status.startedAt)}\n${lines.join('\n')}`;
   };
 
@@ -208,11 +213,11 @@ async function main() {
 
     for (const person of job.persons) {
       if (booked.has(person.name)) {
-        await bot.send(job.chatId, `ℹ️ ${esc(person.name)} уже записан в этом запуске: ${booked.get(person.name)}`);
+        await bot.send(job.chatId, `ℹ️ ${esc(person.name)} уже записан: ${esc(booked.get(person.name))}`);
         continue;
       }
+      let slot = job.slot ? `${fmtDay(job.slot.date)} ${job.slot.time}` : 'слот, выбранный в окне';
       try {
-        let slot = job.slot ? `${fmtDay(job.slot.date)} ${job.slot.time}` : 'слот, выбранный в окне';
         let res;
         if (job.type === 'fill') {
           record('book', { ...job.slot, dry: cfg.bookingDryRun });
@@ -225,10 +230,10 @@ async function main() {
             const [date, time] = key.split(' ');
             const sess = calendar;
             calendar = null; // дальше окно уйдёт с календаря
+            slot = `${fmtDay(date)} ${time}`;
             try {
-              record('book', { date, time, dry: cfg.bookingDryRun });
+              record('book', { date, time, dry: cfg.bookingDryRun, auto: !!job.auto });
               res = await book(browser, cfg, person, date, time, { ...opts, sess });
-              slot = `${fmtDay(date)} ${time}`;
               break;
             } catch (e) {
               if (!(e instanceof SlotGone) || !job.all) throw e;
@@ -239,12 +244,20 @@ async function main() {
         if (res.dry) {
           await notify(`🧪 Пробный прогон: ${person.name} → ${slot}. Форма заполнена, «Подтвердить» не нажата (BOOKING_DRY_RUN=1).`);
         } else {
-          booked.set(person.name, slot);
+          markBooked(person.name, slot);
           await notify(`✅ ${person.name}: запись на ${slot} отправлена. Проверьте почту ${person.email}.`);
         }
       } catch (e) {
         log(`запись ${person.name} не удалась:`, e.message);
-        await notify(`❌ Не удалось записать ${person.name}: ${e.message}`);
+        if (e.submitted && !cfg.bookingDryRun) {
+          // Запрос ушёл на сайт — запись могла пройти. Второй раз за этого человека не записываем.
+          markBooked(person.name, `${slot}?`);
+          await notify(
+            `❓ ${person.name}: «Подтвердить» на ${slot} нажата, но сайт ответил ошибкой: ${e.message}\n` +
+              `Проверьте почту ${person.email}. Повторно записывать не буду — если записи нет, удалите ` +
+              `${person.name} из data/booked.json.`
+          );
+        } else await notify(`❌ Не удалось записать ${person.name}: ${e.message}`);
       }
     }
     sess = null; // страница ушла с календаря — для опроса нужна новая сессия
@@ -294,8 +307,7 @@ async function main() {
     const people = loadPeople();
     await bot.toOwner(
       `🟢 Мониторинг слотов запущен\nДиапазон: ${fmtDay(cfg.dateFrom)} – ${fmtDay(cfg.dateTo)}\n` +
-        `Подписчиков: ${bot.subs.approved.length}. Автозапись: ${people.length ? people.map((p) => esc(p.name)).join(', ') : 'выключена'}` +
-        `${people.length && cfg.bookingDryRun ? ' (пробный режим)' : ''}\n/status — что происходит`
+        `Подписчиков: ${bot.subs.approved.length}. ${bookingLine(people)}\n/status — что происходит`
     );
   }
 
@@ -341,9 +353,23 @@ async function main() {
 
       if (fresh.length && !ONCE) {
         fresh.forEach((k) => alertedAt.set(k, now));
-        const buttons = loadPeople().length ? slotButtons(fresh) : undefined;
-        await bot.broadcast(slotsMessage(fresh, found, from, to, cfg), { buttons });
-        if (cfg.holdMin > 0 && !jobs.length) await holdWindow();
+        const people = loadPeople();
+        const waiting = cfg.bookingMode === 'auto' ? people.filter((p) => !booked.has(p.name)) : [];
+        if (waiting.length) {
+          // Автозапись: календарь открыт в этой же сессии — записываем сразу, с самого раннего слота
+          // и дальше по порядку. Алерт уходит параллельно, без кнопок: записывает робот.
+          const [date, time] = [...current].sort()[0].split(' ');
+          const names = waiting.map((p) => esc(p.name)).join(', ');
+          log(`автозапись: ${waiting.map((p) => p.name).join(', ')} → начиная с ${date} ${time}`);
+          enqueue({ type: 'book', chatId: bot.ownerId, date, time, persons: waiting, all: true, auto: true });
+          bot
+            .broadcast(`${slotsMessage(fresh, found, from, to, cfg)}\n\n🤖 Записываю автоматически: ${names}`)
+            .catch((e) => log('алерт не отправился:', e.message));
+        } else {
+          const buttons = people.length ? slotButtons(fresh) : undefined;
+          await bot.broadcast(slotsMessage(fresh, found, from, to, cfg), { buttons });
+          if (cfg.holdMin > 0 && !jobs.length) await holdWindow();
+        }
       }
     } catch (e) {
       if (stopping) break;

@@ -13,6 +13,7 @@ const PATHS = {
   profile: path.join(ROOT, '.browser-profile'),
   data: path.join(ROOT, 'data'),
   subscribers: path.join(ROOT, 'data', 'subscribers.json'),
+  booked: path.join(ROOT, 'data', 'booked.json'), // кто уже записан — переживает перезапуск
   people: path.join(ROOT, 'people.json'),
 };
 
@@ -59,6 +60,7 @@ function config() {
     pollMinSec: Number(get('POLL_MIN_SECONDS', '')) || Number(get('POLL_SECONDS', 120)), // пусто — без ускорения
     holdMin: Number(get('HOLD_AFTER_ALERT_MIN', 10)),
     requestDelayMs: Number(get('REQUEST_DELAY_MS', 300)),
+    bookingMode: get('BOOKING_MODE', 'alert') || 'alert',
     bookingDryRun: get('BOOKING_DRY_RUN', '0') === '1',
     nestedDisplay: get('NESTED_DISPLAY', ''),
     freshBrowser: get('FRESH_BROWSER', '1') === '1',
@@ -68,6 +70,9 @@ function config() {
       'https://consulat.gouv.fr/ru/ambassade-de-france-a-tbilissi/appointment?name=Service%20des%20Visas'
     ),
   };
+  if (!['alert', 'auto'].includes(cfg.bookingMode)) {
+    throw new Error(`BOOKING_MODE должен быть alert или auto, сейчас «${cfg.bookingMode}»`);
+  }
   if (!isoDate.test(cfg.dateFrom) || !isoDate.test(cfg.dateTo)) {
     throw new Error(`DATE_FROM/DATE_TO должны быть YYYY-MM-DD, сейчас «${cfg.dateFrom}» / «${cfg.dateTo}»`);
   }

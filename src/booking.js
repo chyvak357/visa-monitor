@@ -56,6 +56,11 @@ async function pickSlot(page, date, time) {
     await sleep(500);
   }
   if (!(await day.isVisible().catch(() => false))) throw new SlotGone(`в календаре нет дня ${date}`);
+  // День открылся уже после загрузки календаря — на странице он серый, нужна новая сессия.
+  const disabled = await day
+    .evaluate((el) => el.classList.contains('is-disabled') || el.getAttribute('aria-disabled') === 'true')
+    .catch(() => false);
+  if (disabled) throw new SlotGone(`день ${date} в открытом календаре закрыт`);
   await day.click();
 
   const slot = page.locator('.btn-custom-slot').filter({ hasText: new RegExp(`^\\s*${time}\\s*$`) }).first();
@@ -160,6 +165,9 @@ async function confirm(page, { dryRun, onStuck, askCode }) {
     const failed = responses.find((r) => / [45]\d\d /.test(r));
     if (failed) throw new BookingError(`сайт ответил ошибкой: ${failed}`);
     return { responses };
+  } catch (e) {
+    e.submitted = true; // «Подтвердить» уже нажата — запись могла пройти, повторять вслепую нельзя
+    throw e;
   } finally {
     page.off('response', onResponse);
   }
